@@ -1,20 +1,28 @@
-"""STEP file reader — converts .stp/.step to a trimesh.Trimesh and pyvista.PolyData."""
+"""STEP file reader — returns one trimesh.Trimesh per solid body."""
 
 import numpy as np
 
 
+# Colors assigned to each body in the viewer (CSS names pyvista understands).
+BODY_COLORS = ["lightsteelblue", "lightsalmon", "lightgreen", "plum", "khaki"]
+
+
 def load_step(filepath: str):
     """
-    Load a STEP file and return (trimesh.Trimesh, pyvista.PolyData).
+    Load a STEP file and return (trimesh_list, pyvista_list).
+
+    Each element corresponds to one solid body found in the file.
+
+    Returns
+    -------
+    trimesh_list : list[trimesh.Trimesh]
+    pyvista_list : list[pyvista.PolyData]
 
     Raises
     ------
     FileNotFoundError
-        If the file path does not exist.
     RuntimeError
-        If the file cannot be parsed or produces no geometry.
     ImportError
-        If pythonocc-core is not installed.
     """
     import os
     if not os.path.isfile(filepath):
@@ -27,7 +35,7 @@ def load_step(filepath: str):
         from OCC.Core.gp import gp_Trsf
         from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
         from OCC.Core.TopExp import TopExp_Explorer
-        from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+        from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED, TopAbs_SOLID, TopAbs_SHELL
         from OCC.Core.BRep import BRep_Tool
         from OCC.Core.TopLoc import TopLoc_Location
     except ImportError as exc:
@@ -46,43 +54,90 @@ def load_step(filepath: str):
         raise RuntimeError(f"STEP file contains no transferable entities: {filepath}")
 
     reader.TransferRoots()
-    shape = reader.OneShape()
+    compound = reader.OneShape()
 
+    # Try to find individual solid bodies; fall back to shells, then the whole compound.
+    solids = _explore_shapes(compound, TopAbs_SOLID)
+    if not solids:
+        solids = _explore_shapes(compound, TopAbs_SHELL)
+    if not solids:
+        solids = [compound]
+
+    trimesh_list = []
+    pyvista_list = []
+
+    for solid in solids:
+        try:
+            tm, pv = _tessellate_shape(solid)
+        except Exception:
+            continue
+        if len(tm.faces) == 0:
+            continue
+        trimesh_list.append(tm)
+        pyvista_list.append(pv)
+
+    if not trimesh_list:
+        raise RuntimeError(
+            "Tessellation produced no geometry. The file may be empty or corrupt."
+        )
+
+    return trimesh_list, pyvista_list
+
+
+def _explore_shapes(parent_shape, shape_type) -> list:
+    from OCC.Core.TopExp import TopExp_Explorer
+    shapes = []
+    explorer = TopExp_Explorer(parent_shape, shape_type)
+    while explorer.More():
+        shapes.append(explorer.Current())
+        explorer.Next()
+    return shapes
+
+
+def _tessellate_shape(shape):
+    """Tessellate a single OCC shape and return (trimesh.Trimesh, pyvista.PolyData)."""
+    from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCC.Core.gp import gp_Trsf
+    from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+    from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.TopLoc import TopLoc_Location
+
+    # Flatten all sub-shape locations to identity to avoid transform extraction issues.
     identity = gp_Trsf()
     builder = BRepBuilderAPI_Transform(shape, identity, True)
-    flat_shape = builder.Shape()
+    flat = builder.Shape()
 
-    mesh_algo = BRepMesh_IncrementalMesh(flat_shape, 0.1, False, 0.5)
+    mesh_algo = BRepMesh_IncrementalMesh(flat, 0.1, False, 0.5)
     mesh_algo.Perform()
 
     vertices_list = []
     faces_list = []
     vertex_offset = 0
 
-    explorer = TopExp_Explorer(flat_shape, TopAbs_FACE)
+    explorer = TopExp_Explorer(flat, TopAbs_FACE)
     while explorer.More():
         face = explorer.Current()
-        location = TopLoc_Location()
-        triangulation = BRep_Tool.Triangulation(face, location)
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation(face, loc)
 
-        if triangulation is None:
+        if tri is None:
             explorer.Next()
             continue
 
-        n_nodes = triangulation.NbNodes()
-        n_triangles = triangulation.NbTriangles()
+        n_nodes = tri.NbNodes()
+        n_tris = tri.NbTriangles()
 
         verts = np.array([
-            [triangulation.Node(i).X(),
-             triangulation.Node(i).Y(),
-             triangulation.Node(i).Z()]
+            [tri.Node(i).X(), tri.Node(i).Y(), tri.Node(i).Z()]
             for i in range(1, n_nodes + 1)
         ])
 
         is_reversed = (face.Orientation() == TopAbs_REVERSED)
         tris = []
-        for j in range(1, n_triangles + 1):
-            n1, n2, n3 = triangulation.Triangle(j).Get()
+        for j in range(1, n_tris + 1):
+            n1, n2, n3 = tri.Triangle(j).Get()
             if is_reversed:
                 tris.append([n1 - 1 + vertex_offset, n3 - 1 + vertex_offset, n2 - 1 + vertex_offset])
             else:
@@ -94,7 +149,7 @@ def load_step(filepath: str):
         explorer.Next()
 
     if not vertices_list:
-        raise RuntimeError("Tessellation produced no geometry. Try a different linear deflection value.")
+        raise RuntimeError("No triangulated faces found on this shape.")
 
     all_verts = np.vstack(vertices_list)
     all_faces = np.array(faces_list, dtype=np.int64)
@@ -103,7 +158,6 @@ def load_step(filepath: str):
 
 
 def _build_meshes(vertices: np.ndarray, faces: np.ndarray):
-    """Convert raw vertex/face arrays into trimesh.Trimesh and pyvista.PolyData."""
     import trimesh
     import pyvista
 
